@@ -38,6 +38,8 @@ struct Engine {
             cerr << "Failed to initialize GLFW" << endl;
             exit(EXIT_FAILURE);
         }
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
         window = glfwCreateWindow(WIDTH, HEIGHT, "Black Hole Simulation", NULL, NULL);
         if (!window) {
             cerr << "Failed to create GLFW window" << endl;
@@ -58,7 +60,7 @@ struct Engine {
     void run() {
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
+        glLoadIdentity(); 
         double left   = -width + offsetX;
         double right  =  width + offsetX;
         double bottom = -height + offsetY;
@@ -213,7 +215,12 @@ void rk4Step(Ray& ray, double dλ, double rs) {
 
 
 int main () {
-    //rays.push_back(Ray(vec2(-1e11, 3.27606302719999999e10), vec2(c, 0.0f)));
+    // spawn a fan of parallel rays coming from the left
+    int numRays = 40;
+    for (int i = 0; i < numRays; i++) {
+        float y = -6.5e10f + (13.0e10f / (numRays - 1)) * i; // spread across viewport height
+        rays.push_back(Ray(vec2(-1e11, y), vec2(c, 0.0)));
+    }
     while(!glfwWindowShouldClose(engine.window)) {
         engine.run();
         SagA.draw();

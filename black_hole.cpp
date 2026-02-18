@@ -32,7 +32,7 @@ struct Camera {
     // Center the camera orbit on the black hole at (0, 0, 0)
     vec3 target = vec3(0.0f, 0.0f, 0.0f); // Always look at the black hole center
     float radius = 6.34194e10f;
-    float minRadius = 1e10f, maxRadius = 1e12f;
+    float minRadius = 1e10f, maxRadius = 1e13f;
 
     float azimuth = 0.0f;
     float elevation = M_PI / 2.0f;
@@ -156,6 +156,7 @@ struct Engine {
     GLuint texture;
     GLuint shaderProgram;
     GLuint computeProgram = 0;
+    GLuint fbo = 0;
     // -- UBOs -- //
     GLuint cameraUBO = 0;
     GLuint diskUBO = 0;
@@ -179,9 +180,14 @@ struct Engine {
             exit(EXIT_FAILURE);
         }
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-        window = glfwCreateWindow(WIDTH, HEIGHT, "Black Hole", nullptr, nullptr);
+        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+        GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+        WIDTH  = mode->width;
+        HEIGHT = mode->height;
+        window = glfwCreateWindow(WIDTH, HEIGHT, "Black Hole", monitor, nullptr);
         if (!window) {
             cerr << "Failed to create GLFW window\n";
             glfwTerminate();
@@ -201,7 +207,14 @@ struct Engine {
         this->shaderProgram = CreateShaderProgram();
         gridShaderProgram = CreateShaderProgram("grid.vert", "grid.frag");
 
-        computeProgram = CreateComputeProgram("geodesic.comp");
+        computeProgram = CreateShaderProgram("passthrough.vert", "geodesic.frag");
+        GLuint _idx;
+        _idx = glGetUniformBlockIndex(computeProgram, "Camera");
+        glUniformBlockBinding(computeProgram, _idx, 1);
+        _idx = glGetUniformBlockIndex(computeProgram, "Disk");
+        glUniformBlockBinding(computeProgram, _idx, 2);
+        _idx = glGetUniformBlockIndex(computeProgram, "Objects");
+        glUniformBlockBinding(computeProgram, _idx, 3);
         glGenBuffers(1, &cameraUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, cameraUBO);
         glBufferData(GL_UNIFORM_BUFFER, 128, nullptr, GL_DYNAMIC_DRAW); // alloc ~128 bytes
@@ -225,6 +238,12 @@ struct Engine {
         auto result = QuadVAO();
         this->quadVAO = result[0];
         this->texture = result[1];
+
+        // FBO so raytracer renders at COMPUTE_WIDTH x COMPUTE_HEIGHT and upscales
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
     void generateGrid(const vector<ObjectData>& objects) {
         const int gridSize = 25;
@@ -462,37 +481,33 @@ struct Engine {
         return prog;
     }
     void dispatchCompute(const Camera& cam) {
-        // determine target compute‐res
-        int cw = cam.moving ? COMPUTE_WIDTH  : 200;
-        int ch = cam.moving ? COMPUTE_HEIGHT : 150;
-
-        // 1) reallocate the texture if needed
-        glBindTexture(GL_TEXTURE_2D, texture);
-        glTexImage2D(GL_TEXTURE_2D,
-                    0,                // mip
-                    GL_RGBA8,         // internal format
-                    cw,               // width
-                    ch,               // height
-                    0, GL_RGBA, 
-                    GL_UNSIGNED_BYTE, 
-                    nullptr);
-
-        // 2) bind compute program & UBOs
+        // 1) Render raytracer into the low-res texture via FBO
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, COMPUTE_WIDTH, COMPUTE_HEIGHT);
+        glClear(GL_COLOR_BUFFER_BIT);
         glUseProgram(computeProgram);
         uploadCameraUBO(cam);
         uploadDiskUBO();
         uploadObjectsUBO(objects);
+        glUniform2f(glGetUniformLocation(computeProgram, "resolution"),
+                    (float)COMPUTE_WIDTH, (float)COMPUTE_HEIGHT);
+        glUniform1f(glGetUniformLocation(computeProgram, "camRadius"), cam.radius);
+        glBindVertexArray(quadVAO);
+        glDisable(GL_DEPTH_TEST);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glEnable(GL_DEPTH_TEST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-        // 3) bind it as image unit 0
-        glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-
-        // 4) dispatch grid
-        GLuint groupsX = (GLuint)std::ceil(cw / 16.0f);
-        GLuint groupsY = (GLuint)std::ceil(ch / 16.0f);
-        glDispatchCompute(groupsX, groupsY, 1);
-
-        // 5) sync
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+        // 2) Upscale the texture to the full window
+        glViewport(0, 0, WIDTH, HEIGHT);
+        glUseProgram(shaderProgram);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glUniform1i(glGetUniformLocation(shaderProgram, "screenTexture"), 0);
+        glBindVertexArray(quadVAO);
+        glDisable(GL_DEPTH_TEST);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glEnable(GL_DEPTH_TEST);
     }
     void uploadCameraUBO(const Camera& cam) {
         struct UBOData {
@@ -546,7 +561,7 @@ struct Engine {
     void uploadDiskUBO() {
         // disk
         float r1 = SagA.r_s * 2.2f;    // inner radius just outside the event horizon
-        float r2 = SagA.r_s * 5.2f;   // outer radius of the disk
+        float r2 = SagA.r_s * 30.0f;  // outer radius — large enough to see when zoomed out
         float num = 2.0;               // number of rays
         float thickness = 1e9f;          // padding for std140 alignment
         float diskData[4] = { r1, r2, num, thickness };
@@ -685,19 +700,16 @@ int main() {
 
 
 
-        // ---------- GRID ------------- //
-        // 2) rebuild grid mesh on CPU
+        // ---------- RUN RAYTRACER (background) ------------- //
+        glViewport(0, 0, engine.WIDTH, engine.HEIGHT);
+        engine.dispatchCompute(camera);
+
+        // ---------- GRID (overlay) ------------- //
         engine.generateGrid(objects);
-        // 5) overlay the bent grid
         mat4 view = lookAt(camera.position(), camera.target, vec3(0,1,0));
         mat4 proj = perspective(radians(60.0f), float(engine.COMPUTE_WIDTH)/engine.COMPUTE_HEIGHT, 1e9f, 1e14f);
         mat4 viewProj = proj * view;
         engine.drawGrid(viewProj);
-
-        // ---------- RUN RAYTRACER ------------- //
-        glViewport(0, 0, engine.WIDTH, engine.HEIGHT);
-        engine.dispatchCompute(camera);
-        engine.drawFullScreenQuad();
 
         // 6) present to screen
         glfwSwapBuffers(engine.window);
